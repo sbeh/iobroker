@@ -66,39 +66,57 @@
 
     <script>
         /**
-         * Creates sliding windows from flat time series data
+         * Creates sliding window tensors from flat time series data using GPU operations
          * @param {Array} flatData - Array of {url, value} objects
          * @param {number} inputWindowSize - Size of input window
          * @param {number} labelWindowSize - Size of label window
-         * @returns {Array} Array of {url, inputs, labels} objects
+         * @returns {Object} Object with inputs and labels tensors, plus metadata array
          */
-        function createSlidingWindows(flatData, inputWindowSize, labelWindowSize) {
+        function createSlidingWindowTensors(flatData, inputWindowSize, labelWindowSize) {
             const windowSize = inputWindowSize + labelWindowSize
-            const result = []
+            const numWindows = flatData.length - windowSize + 1
             
-            for (let i = 0; i <= flatData.length - windowSize; i++) {
-                const inputs = []
-                const labels = []
-                
-                // Extract input values
-                for (let j = 0; j < inputWindowSize; j++) {
-                    inputs.push(flatData[i + j].value)
-                }
-                
-                // Extract label values
-                for (let j = 0; j < labelWindowSize; j++) {
-                    labels.push(flatData[i + inputWindowSize + j].value)
-                }
-                
-                // Use the URL from the first element of the window
-                result.push({
-                    url: flatData[i].url,
-                    inputs: inputs,
-                    labels: labels
-                })
+            if (numWindows <= 0) {
+                throw new Error(`Insufficient data: need at least ${windowSize} points, got ${flatData.length}`)
             }
             
-            return result
+            // Extract values and URLs into separate arrays
+            const values = flatData.map(d => d.value)
+            const urls = flatData.map(d => d.url)
+            
+            // Create a 1D tensor with all values - this goes to GPU
+            const valuesTensor = tf.tensor1d(values)
+            
+            // Create sliding windows using tensor operations (on GPU)
+            const inputsArray = []
+            const labelsArray = []
+            
+            for (let i = 0; i < numWindows; i++) {
+                // Slice input window from the tensor
+                const inputSlice = valuesTensor.slice(i, inputWindowSize)
+                inputsArray.push(inputSlice)
+                
+                // Slice label window from the tensor
+                const labelSlice = valuesTensor.slice(i + inputWindowSize, labelWindowSize)
+                labelsArray.push(labelSlice)
+            }
+            
+            // Stack all windows into 2D tensors [numWindows, windowSize]
+            const inputs = tf.stack(inputsArray)
+            const labels = tf.stack(labelsArray)
+            
+            // Clean up intermediate tensors
+            valuesTensor.dispose()
+            inputsArray.forEach(t => t.dispose())
+            labelsArray.forEach(t => t.dispose())
+            
+            // Create metadata array for URLs (lightweight, stays in RAM)
+            const metadata = []
+            for (let i = 0; i < numWindows; i++) {
+                metadata.push({ url: urls[i] })
+            }
+            
+            return { inputs, labels, metadata }
         }
 
         async function train(quick, modelname, getSampleWeights, getModel, inputWindowSize, labelWindowSize) {
@@ -115,23 +133,35 @@
             console.log(`${data.length} datasets loaded`)
             window.data = data
 
+            let inputs, labels, metadata
+            
             // Detect data format and convert if necessary
-            let processedData = data
             if (data.length > 0 && Object.prototype.hasOwnProperty.call(data[0], 'value') && !Object.prototype.hasOwnProperty.call(data[0], 'inputs')) {
-                // New flat format - convert to sliding windows
+                // New flat format - convert to sliding windows using tensor operations
                 if (inputWindowSize === undefined || labelWindowSize === undefined) {
                     throw new Error('inputWindowSize and labelWindowSize are required for flat data format')
                 }
-                console.log(`Converting flat data to sliding windows (input: ${inputWindowSize}, label: ${labelWindowSize})`)
-                processedData = createSlidingWindows(data, inputWindowSize, labelWindowSize)
-                console.log(`${processedData.length} windows created from ${data.length} data points`)
+                console.log(`Converting flat data to sliding windows using tensor operations (input: ${inputWindowSize}, label: ${labelWindowSize})`)
+                const result = createSlidingWindowTensors(data, inputWindowSize, labelWindowSize)
+                inputs = result.inputs
+                labels = result.labels
+                metadata = result.metadata
+                console.log(`${metadata.length} windows created from ${data.length} data points using GPU operations`)
+            } else {
+                // Old format - convert to tensors directly
+                if (data.length === 0) {
+                    throw new Error('No data available for training')
+                }
+                inputs = tf.tensor(data.map(d => d.inputs))
+                labels = tf.tensor(data.map(d => d.labels))
+                metadata = data.map(d => ({ url: d.url }))
             }
 
-            if (processedData.length === 0) {
-                throw new Error('No data available for training')
-            }
+            window.inputs = inputs
+            window.labels = labels
+            window.metadata = metadata
 
-            const model = getModel(processedData[0].inputs.length, processedData[0].labels.length)
+            const model = getModel(inputs.shape[1], labels.shape[1])
             window.model = model
 
             let tfvisOnEpochEnd
@@ -149,7 +179,7 @@
                 ).onEpochEnd
             }
 
-            const sampleWeights = getSampleWeights(processedData[0].labels.length)
+            const sampleWeights = getSampleWeights(labels.shape[1])
             const loss = (labels, predictions, weights_, reduction) =>
                 tf.losses.meanSquaredError(labels, predictions, sampleWeights, reduction)
             model.compile({
@@ -159,10 +189,6 @@
             })
             console.log('model compiled')
 
-            const inputs = tf.tensor(processedData.map(d => d.inputs))
-            window.inputs = inputs
-            const labels = tf.tensor(processedData.map(d => d.labels))
-            window.labels = labels
 
             let onEpochEndRuns = false
             let timeLast = Date.now()
@@ -190,22 +216,30 @@
                                 const mse = mseP.sum(1)
                                 const mseMI = mse.argMax()
                                 const mseMaxI = mseMI.dataSync()[0]
-                                //const y = labels.slice(mseMaxI, 1)
-                                const p = predictions.slice(mseMaxI, 1)
-
+                                
                                 const iframe = document.getElementById('iframe')
-                                if (!window.iframeBlocked && processedData[mseMaxI].url) {
+                                if (!window.iframeBlocked && metadata[mseMaxI].url) {
                                     window.iframeBlocked = true
                                     setTimeout(() => {
                                         window.iframeBlocked = false
                                     }, 10000)
-                                    iframe.src = processedData[mseMaxI].url
+                                    iframe.src = metadata[mseMaxI].url
                                 }
+
+                                // Get the input and label tensors for the worst prediction
+                                const inputSlice = inputs.slice([mseMaxI, 0], [1, -1]).squeeze()
+                                const labelSlice = labels.slice([mseMaxI, 0], [1, -1]).squeeze()
+                                const predictionSlice = predictions.slice([mseMaxI, 0], [1, -1]).squeeze()
+                                
+                                // Convert to arrays for visualization
+                                const inputValues = Array.from(inputSlice.dataSync())
+                                const labelValues = Array.from(labelSlice.dataSync())
+                                const predictionValues = Array.from(predictionSlice.dataSync())
 
                                 tfvis.render.scatterplot(
                                     { name: 'Inputs' },
                                     {
-                                        values: processedData[mseMaxI].inputs.map((v, i) => ({ x: i, y: v })),
+                                        values: inputValues.map((v, i) => ({ x: i, y: v })),
                                     },
                                     {
                                         xLabel: 'Time',
@@ -217,8 +251,8 @@
                                     { name: 'Actual vs Prediction' },
                                     {
                                         values: [
-                                            processedData[mseMaxI].labels.map((v, i) => ({ x: i, y: v })),
-                                            Array.from(p.dataSync(), (v, i) => ({ x: i, y: v }))
+                                            labelValues.map((v, i) => ({ x: i, y: v })),
+                                            predictionValues.map((v, i) => ({ x: i, y: v }))
                                         ], series: ['actual', 'predicted']
                                     },
                                     {
@@ -228,10 +262,10 @@
                                     }
                                 )
 
-                                p.dispose()
-                                //y.dispose()
-                                mseMI.dispose()
-                                mse.dispose()
+                                // Clean up tensors
+                                inputSlice.dispose()
+                                labelSlice.dispose()
+                                predictionSlice.dispose()
                                 mseP.dispose()
                                 predictions.dispose()
                             }
