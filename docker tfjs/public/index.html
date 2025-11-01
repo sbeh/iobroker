@@ -117,9 +117,9 @@
 
             // Detect data format and convert if necessary
             let processedData = data
-            if (data.length > 0 && data[0].hasOwnProperty('value') && !data[0].hasOwnProperty('inputs')) {
+            if (data.length > 0 && Object.prototype.hasOwnProperty.call(data[0], 'value') && !Object.prototype.hasOwnProperty.call(data[0], 'inputs')) {
                 // New flat format - convert to sliding windows
-                if (!inputWindowSize || !labelWindowSize) {
+                if (inputWindowSize === undefined || labelWindowSize === undefined) {
                     throw new Error('inputWindowSize and labelWindowSize are required for flat data format')
                 }
                 console.log(`Converting flat data to sliding windows (input: ${inputWindowSize}, label: ${labelWindowSize})`)
