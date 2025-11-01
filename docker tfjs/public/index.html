@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>TensorFlow.js Heizung</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs/dist/tf.min.js"></script>
+    <!--<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl/dist/tf-backend-webgl.min.js"></script>-->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-vis/dist/tfjs-vis.umd.min.js"></script><!---->
+
+</head>
+
+<body>
+    <div>
+    <table>
+        <tr>
+            <td></td>
+            <td>Now</td>
+            <td>1</td>
+            <td>5</td>
+            <td>15</td>
+        </tr>
+        <tr>
+            <td>Epochs/Minute</td>
+            <td><input disabled id="epochs_" type="number"></td>
+            <td><input disabled id="epochs1" type="number"></td>
+            <td><input disabled id="epochs5" type="number"></td>
+            <td><input disabled id="epochs15" type="number"></td>
+        </tr>
+        <tr>
+            <td>Loss</td>
+            <td><input disabled id="loss_" type="number"></td>
+            <td><input disabled id="loss1" type="number"></td>
+            <td><input disabled id="loss5" type="number"></td>
+            <td><input disabled id="loss15" type="number"></td>
+        </tr>
+        <tr>
+            <td>MSE</td>
+            <td><input disabled id="mse_" type="number"></td>
+            <td><input disabled id="mse1" type="number"></td>
+            <td><input disabled id="mse5" type="number"></td>
+            <td><input disabled id="mse15" type="number"></td>
+        </tr>
+        <tr>
+            <td>Accuracy</td>
+            <td><input disabled id="acc_" type="number"></td>
+            <td><input disabled id="acc1" type="number"></td>
+            <td><input disabled id="acc5" type="number"></td>
+            <td><input disabled id="acc15" type="number"></td>
+        </tr>
+    </table>
+    Epoch: <input disabled id="epoch" type="number">
+    <br>
+
+    <button id="run" disabled onclick="run(false)">Run</button>
+    <button id="progress" disabled onclick="progress()">Toggle visualization</button>
+    <button id="stop" disabled onclick="model.stopTraining = true">Stop training</button>
+    <br>
+    <button onclick="outside_temperature_humidity_predict()">Predict Outside Temperature & Humidity</button>
+    <button onclick="from_midnight_outside_temperature_humidity_predict()">Predict from Midnight, Outside Temperature &
+        Humidity</button>
+    </div>
+    <div style="position: fixed; top: 20%; left: 0; right: 35%; bottom: 0; border-top: 2px solid #ccc;">
+        <iframe style="width: 100%; height: 100%; border: none;" id="iframe"></iframe>
+    </div>
+
+    <script>
+        async function train(quick, modelname, getSampleWeights, getModel) {
+            document.getElementById('run').disabled = true
+            document.getElementById('progress').disabled = false
+
+            const data = await (await fetch('http://192.168.178.120:5001/read', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: `SELECT * FROM model_train('${modelname}', ${quick})`
+            })).json()
+            console.log(`${data.length} datasets loaded`)
+            window.data = data
+
+            const model = getModel(data[0].inputs.length, data[0].labels.length)
+            window.model = model
+
+            let tfvisOnEpochEnd
+            if (typeof tfvis !== 'undefined') {
+                tfvis.show.modelSummary({ name: 'Model Summary' }, model)
+                tfvisOnEpochEnd = tfvis.show.fitCallbacks(
+                    { name: 'Training Performance' },
+                    ['loss', 'mse', 'acc'],
+                    {
+                        callbacks: ['onEpochEnd'],
+                        zoomToFitAccuracy: true,
+                        yAxisDomain: [0, 20],
+                        height: 300,
+                    }
+                ).onEpochEnd
+            }
+
+            const sampleWeights = getSampleWeights(data[0].labels.length)
+            const loss = (labels, predictions, weights_, reduction) =>
+                tf.losses.meanSquaredError(labels, predictions, sampleWeights, reduction)
+            model.compile({
+                optimizer: tf.train.adamax(decay = 0.001),
+                loss,
+                metrics: ['mse', 'acc'],
+            })
+            console.log('model compiled')
+
+            const inputs = tf.tensor(data.map(d => d.inputs))
+            window.inputs = inputs
+            const labels = tf.tensor(data.map(d => d.labels))
+            window.labels = labels
+
+            let onEpochEndRuns = false
+            let timeLast = Date.now()
+            let epochLast = 0
+            const callbacks = {
+                onTrainBegin: () => {
+                    document.getElementById('stop').disabled = false
+                    for (let j of ['epochs', 'loss', 'mse', 'acc'])
+                        for (let i of ['_', 1, 5, 15])
+                            document.getElementById(`${j}${i}`).value = ''
+                },
+                onEpochEnd: (epoch, logs) => {
+                    if (!progressVisible)
+                        return
+                    if (onEpochEndRuns)
+                        return
+                    onEpochEndRuns = true
+                    setTimeout(() => {
+                        try {
+                            if (tfvisOnEpochEnd) {
+                                tfvisOnEpochEnd(epoch, logs)
+
+                                const predictions = model.predict(inputs)
+                                const mseP = tf.losses.meanSquaredError(labels, predictions, sampleWeights, tf.Reduction.NONE)
+                                const mse = mseP.sum(1)
+                                const mseMI = mse.argMax()
+                                const mseMaxI = mseMI.dataSync()[0]
+                                //const y = labels.slice(mseMaxI, 1)
+                                const p = predictions.slice(mseMaxI, 1)
+
+                                const iframe = document.getElementById('iframe')
+                                if (!window.iframeBlocked && data[mseMaxI].url) {
+                                    window.iframeBlocked = true
+                                    setTimeout(() => {
+                                        window.iframeBlocked = false
+                                    }, 10000)
+                                    iframe.src = data[mseMaxI].url
+                                }
+
+                                tfvis.render.scatterplot(
+                                    { name: 'Inputs' },
+                                    {
+                                        values: data[mseMaxI].inputs.map((v, i) => ({ x: i, y: v })),
+                                    },
+                                    {
+                                        xLabel: 'Time',
+                                        yLabel: 'Value',
+                                        height: 300
+                                    }
+                                )
+                                tfvis.render.scatterplot(
+                                    { name: 'Actual vs Prediction' },
+                                    {
+                                        values: [
+                                            data[mseMaxI].labels.map((v, i) => ({ x: i, y: v })),
+                                            Array.from(p.dataSync(), (v, i) => ({ x: i, y: v }))
+                                        ], series: ['actual', 'predicted']
+                                    },
+                                    {
+                                        xLabel: 'Time',
+                                        yLabel: 'Value',
+                                        height: 300
+                                    }
+                                )
+
+                                p.dispose()
+                                //y.dispose()
+                                mseMI.dispose()
+                                mse.dispose()
+                                mseP.dispose()
+                                predictions.dispose()
+                            }
+
+                            const timeNow = Date.now()
+                            const timeDiffMilliseconds = timeNow - timeLast
+                            if (timeDiffMilliseconds > 1000) {
+                                document.getElementById('epoch').value = epoch
+
+                                const timeDiffMinutes = timeDiffMilliseconds / 1000 / 60
+
+                                const epochDiff = (epoch - epochLast) / timeDiffMinutes
+                                epochLast = epoch
+
+                                for (let j of ['epochs', 'loss', 'mse', 'acc'])
+                                    for (let i of ['_', 1, 5, 15]) {
+                                        let value = j == 'epochs' ? epochDiff : logs[j]
+                                        const last = document.getElementById(`${j}${i}`).value
+                                        if (i !== '_' && last !== '') {
+                                            const weight = timeDiffMinutes / i
+                                            value = (1 - weight) * last + weight * value
+                                        }
+                                        document.getElementById(`${j}${i}`).value = value
+                                    }
+                                timeLast = timeNow
+                            }
+                        } catch (e) {
+                            console.error(e)
+                        }
+                        onEpochEndRuns = false
+                    }, 0)
+                },
+                onTrainEnd: () => {
+                    document.getElementById('stop').disabled = true
+                },
+            }
+            // tf.callbacks.earlyStopping(), TODO does not work, maybe window wasn't in foreground?
+            window.fitHistory = await model.fit(inputs, labels, {
+                batchSize: quick ? 32 : 128,
+                epochs: quick ? 10 : Number.MAX_VALUE,
+                callbacks,
+                validationSplit: 0.2,
+                shuffle: true,
+                // sampleWeight, Error: sample weight is not supported yet.
+            })
+            console.log('model trained')
+
+            if (!quick) {
+                await model.save(`localstorage://${modelname}`)
+                await model.save(`http://192.168.178.120:5001/${modelname}/store`)
+                console.log('model saved')
+            }
+
+            document.getElementById('run').disabled = false
+            document.getElementById('progress').disabled = true
+        }
+        let progressVisible = true
+        async function progress() {
+            progressVisible = !progressVisible
+        }
+
+        async function outside_temperature_bath_temperature_heatpump_compressor_current_to_bath_temperature(quick) {
+            train(quick, 'outside_temperature_bath_temperature_heatpump_compressor_current_to_bath_temperature',
+                () => tf.fill([48], 1),
+                (noOfInputs, noOfLabels) => {
+                    const model = tf.sequential()
+
+                    model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 4 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 2 * noOfInputs }))
+                    model.add(tf.layers.dense({ units: noOfLabels }))
+
+                    //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
+                    return model
+                })
+        }
+        async function outside_temperature_humidity(quick) {
+            train(quick, 'outside_temperature_humidity',
+                () => tf.fill([48], 0.8).concat(tf.fill([48], 0.2)),
+                (noOfInputs, noOfLabels) => {
+                    const model = tf.sequential()
+
+                    model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 4 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 2 * noOfInputs }))
+                    model.add(tf.layers.dense({ units: noOfLabels }))
+
+                    //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
+                    return model
+                })
+        }
+        async function outside_temperature_humidity_predict() {
+            const model = await tf.loadLayersModel('localstorage://outside_temperature_humidity')
+            console.log('model loaded')
+
+            window.data = await (await fetch('http://192.168.178.120:5000/read', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: `
+SELECT
+array(
+    SELECT value
+    FROM metric_result('mindsdb Bath', -47*60*60, 60*60)
+    WHERE metric IN ('outside_temperature', 'outside_humidity')
+    ORDER BY metric DESC, time ASC
+) ||
+ARRAY[
+    (suncalc.get_sun_position(CURRENT_TIMESTAMP, 52, 8.5)).azimuth,
+    (suncalc.get_sun_position(CURRENT_TIMESTAMP, 52, 8.5)).altitude,
+    EXTRACT(DOY FROM CURRENT_TIMESTAMP)
+] X`})).json()
+            console.log('data loaded')
+
+            console.log(data[0].x)
+            window.predictions = model.predict(tf.tensor([data[0].x])).dataSync()
+            console.log(window.predictions)
+            console.log('predictions calculated')
+
+            queryValues = Array.from(predictions).map((p, i) =>
+                `(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP + INTERVAL '${i % 48 + 1} hour'), '${[
+                    'Outside Temperature',
+                    'Outside Humidity'
+                ][Math.floor(i / 48)]}', ${p})`)
+
+            const deleted = await (await fetch('http://192.168.178.120:5000/write', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: 'DELETE FROM prediction WHERE metric IN (\'Outside Temperature\', \'Outside Humidity\')'
+            })).json()
+
+            const inserted = await (await fetch('http://192.168.178.120:5000/write', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: `INSERT INTO prediction VALUES ${queryValues.join(', ')}`
+            })).json()
+
+            console.log('predictions written, deleted and inserted rows:', deleted, inserted)
+        }
+        async function from_midnight_outside_temperature_humidity(quick) {
+            train(quick, 'from_midnight_outside_temperature_humidity',
+                () => tf.fill([48], 0.8).concat(tf.fill([48], 0.2)),
+                (noOfInputs, noOfLabels) => {
+                    const model = tf.sequential()
+
+                    //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 4 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 2 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: noOfLabels }))
+
+                    model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
+                    return model
+                })
+        }
+        async function from_midnight_outside_temperature_humidity_predict() {
+            const model = await tf.loadLayersModel('localstorage://from_midnight_outside_temperature_humidity')
+            console.log('model loaded')
+
+            window.data = await (await fetch('http://192.168.178.120:5000/read', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: `
+SELECT
+array(
+    SELECT value
+    FROM metric_result('mindsdb Bath', start, 60*60, stop)
+    WHERE metric IN ('outside_temperature', 'outside_humidity')
+    ORDER BY metric DESC, time ASC
+) ||
+ARRAY[
+    (suncalc.get_sun_position(stop_ts, 52, 8.5)).azimuth,
+    (suncalc.get_sun_position(stop_ts, 52, 8.5)).altitude,
+    EXTRACT(DOY FROM stop_ts)
+] X FROM (
+    SELECT
+        EXTRACT(EPOCH FROM CURRENT_DATE - 2)::INTEGER start,
+        EXTRACT(EPOCH FROM CURRENT_DATE)::INTEGER stop,
+        CURRENT_DATE::TIMESTAMP stop_ts
+) _`})).json()
+            console.log('data loaded')
+
+            window.predictions = model.predict(tf.tensor([data[0].x])).dataSync()
+            console.log('predictions calculated')
+
+            queryValues = Array.from(predictions).map((p, i) =>
+                `(EXTRACT(EPOCH FROM CURRENT_DATE + INTERVAL '${i % 48 + 1} hour'), '${[
+                    'Outside Temperature',
+                    'Outside Humidity'
+                ][Math.floor(i / 48)]}', ${p})`)
+
+            const deleted = await (await fetch('http://192.168.178.120:5000/write', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: 'DELETE FROM prediction WHERE metric IN (\'Outside Temperature\', \'Outside Humidity\')'
+            })).json()
+
+            const inserted = await (await fetch('http://192.168.178.120:5000/write', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: `INSERT INTO prediction VALUES ${queryValues.join(', ')}`
+            })).json()
+
+            console.log('predictions written, deleted and inserted rows:', deleted, inserted)
+        }
+        async function outside_temperature_humidity_compressor_current_defrost(quick) {
+            train(quick, 'outside_temperature_humidity_compressor_current_defrost',
+                () => tf.fill([48], 1)/*.concat(tf.fill([48], 0.2))*/,
+                (noOfInputs, noOfLabels) => {
+                    const model = tf.sequential()
+
+                    model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 4 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 2 * noOfInputs }))
+                    model.add(tf.layers.dense({ units: noOfLabels }))
+
+                    //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
+                })
+        }
+        async function outside_temperature_humidity_compressor_current_defrost_bath_temperature(quick) {
+            train(quick, 'outside_temperature_humidity_compressor_current_defrost_bath_temperature',
+                () => tf.fill([48], 1)/*.concat(tf.fill([48], 0.2))*/,
+                (noOfInputs, noOfLabels) => {
+                    const model = tf.sequential()
+
+                    //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 4 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 2 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: noOfLabels }))
+
+                    model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
+                    return model
+                })
+        } // 0.48 0.48 0.065
+        async function from_midnight_outside_temperature_humidity_compressor_current_bath_temperature(quick) {
+            train(quick, 'from_midnight_outside_temperature_humidity_compressor_current_bath_temperature',
+                () => tf.fill([noOfLabels], 1)/*.concat(tf.fill([48], 0.2))*/,
+                (noOfInputs, noOfLabels) => {
+                    const model = tf.sequential()
+
+                    model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 4 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 2 * noOfInputs }))
+                    model.add(tf.layers.dense({ units: noOfLabels }))
+
+                    //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
+                    return model
+                })
+        } // 0.48 0.48 0.065
+        async function from_midnight_outside_temperature_humidity_compressor_current_bath_temperature_predict() {
+            const model = await tf.loadLayersModel('localstorage://from_midnight_outside_temperature_humidity_compressor_current_bath_temperature')
+            console.log('model loaded')
+
+            window.data = await (await fetch('http://192.168.178.120:5000/read', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: `
+SELECT
+ARRAY[
+    (suncalc.get_sun_position(CURRENT_DATE, 52, 8.5)).azimuth,
+    (suncalc.get_sun_position(CURRENT_DATE, 52, 8.5)).altitude,
+    EXTRACT(DOY FROM CURRENT_DATE)
+] || array(
+    SELECT value
+    FROM metric_result('mindsdb Bath', EXTRACT(EPOCH FROM CURRENT_DATE - 2)::INTEGER, 60*60, EXTRACT(EPOCH FROM CURRENT_DATE)::INTEGER)
+    WHERE metric IN ('bath_temperature', 'outside_humidity', 'outside_temperature')
+    ORDER BY metric ASC, time ASC
+) ||
+array(
+    SELECT value
+    FROM metric_result('mindsdb Bath', EXTRACT(EPOCH FROM CURRENT_DATE)::INTEGER, 60*60, EXTRACT(EPOCH FROM CURRENT_DATE + 2)::INTEGER)
+    WHERE metric IN ('heatpump_compressor_current')
+    ORDER BY metric ASC, time ASC
+) X`})).json()
+            console.log('data loaded')
+
+            window.predictions = model.predict(tf.tensor([data[0].x])).dataSync()
+            console.log('predictions calculated')
+
+            queryValues = Array.from(predictions).map((p, i) =>
+                `(EXTRACT(EPOCH FROM CURRENT_DATE + INTERVAL '${i % 48 + 1} hour'), 'bath_temperature', ${p})`)
+
+            const deleted = await (await fetch('http://192.168.178.120:5000/write', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: 'DELETE FROM prediction WHERE metric IN (\'bath_temperature\')'
+            })).json()
+
+            const inserted = await (await fetch('http://192.168.178.120:5000/write', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: `INSERT INTO prediction VALUES ${queryValues.join(', ')}`
+            })).json()
+
+            console.log('predictions written, deleted and inserted rows:', deleted, inserted)
+        }
+        async function bath_window(quick) {
+            train(quick, 'bath_window3',
+                noOfLabels => tf.fill([noOfLabels], 1),
+                (noOfInputs, noOfLabels) => {
+                    const model = tf.sequential()
+
+                    model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 4 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    //model.add(tf.layers.dense({ units: 3 * noOfInputs }))
+                    model.add(tf.layers.dense({ units: 2 * noOfInputs }))
+                    model.add(tf.layers.dense({ units: noOfLabels }))
+
+                    //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
+                    return model
+                })
+        }
+        function run(quick) {
+            //outside_temperature_humidity(quick)
+            //outside_temperature_bath_temperature_heatpump_compressor_current_to_bath_temperature(quick)
+            //from_midnight_outside_temperature_humidity(quick)
+            //outside_temperature_humidity_compressor_current_defrost(quick)
+            //outside_temperature_humidity_compressor_current_defrost_bath_temperature(quick)
+            //from_midnight_outside_temperature_humidity_compressor_current_bath_temperature(quick)
+            bath_window(quick)
+
+            if (!quick) {
+                //outside_temperature_humidity_predict()
+                //from_midnight_outside_temperature_humidity_predict()
+                //from_midnight_outside_temperature_humidity_compressor_current_bath_temperature_predict()
+            }
+        }
+        tf.setBackend('webgpu').then(() => run(true)).catch(e => {
+            console.error(e)
+            document.write(`<br><br><span style="color: red">Error: ${e}<br><br>You might want to check chrome://flags/#unsafely-treat-insecure-origin-as-secure</span>`)
+        })
+    </script>
+</body>
+
+</html>
