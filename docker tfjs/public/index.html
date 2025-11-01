@@ -127,6 +127,10 @@
                 console.log(`${processedData.length} windows created from ${data.length} data points`)
             }
 
+            if (processedData.length === 0) {
+                throw new Error('No data available for training')
+            }
+
             const model = getModel(processedData[0].inputs.length, processedData[0].labels.length)
             window.model = model
 
