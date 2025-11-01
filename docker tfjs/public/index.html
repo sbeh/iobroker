@@ -65,7 +65,89 @@
     </div>
 
     <script>
-        async function train(quick, modelname, getSampleWeights, getModel) {
+        /**
+         * Creates sliding window tensors from flat time series data using GPU operations
+         * Supports both array and compact object formats:
+         * - Array format: [{url, value}, ...]
+         * - Compact format: {baseUrl, url: [...], value: [...]}
+         * 
+         * @param {Array|Object} flatData - Flat time series data
+         * @param {number} inputWindowSize - Size of input window
+         * @param {number} labelWindowSize - Size of label window
+         * @returns {Object} Object with inputs and labels tensors, plus metadata array
+         */
+        function createSlidingWindowTensors(flatData, inputWindowSize, labelWindowSize) {
+            const windowSize = inputWindowSize + labelWindowSize
+            
+            // Handle both data formats
+            let values, urls, baseUrl
+            if (Array.isArray(flatData)) {
+                // Old array format: [{url, value}, ...]
+                values = flatData.map(d => d.value)
+                urls = flatData.map(d => d.url)
+                baseUrl = null
+            } else {
+                // New compact format: {baseUrl, url: [...], value: [...]}
+                values = flatData.value
+                urls = flatData.url
+                baseUrl = flatData.baseUrl || ''
+            }
+            
+            if (values.length < windowSize) {
+                throw new Error(`Insufficient data: need at least ${windowSize} points, got ${values.length}`)
+            }
+            
+            // Create sliding windows, skipping windows with NULL values
+            const inputsArray = []
+            const labelsArray = []
+            const metadata = []
+            
+            for (let i = 0; i <= values.length - windowSize; i++) {
+                // Check if window contains any NULL/undefined values
+                let hasNull = false
+                for (let j = 0; j < windowSize; j++) {
+                    if (values[i + j] === null || values[i + j] === undefined) {
+                        hasNull = true
+                        break
+                    }
+                }
+                
+                // Skip windows with NULL values
+                if (hasNull) {
+                    continue
+                }
+                
+                // Extract input and label values for this window
+                const inputValues = values.slice(i, i + inputWindowSize)
+                const labelValues = values.slice(i + inputWindowSize, i + windowSize)
+                
+                // Create tensors for this window
+                inputsArray.push(tf.tensor1d(inputValues))
+                labelsArray.push(tf.tensor1d(labelValues))
+                
+                // Store metadata
+                const url = baseUrl ? baseUrl + urls[i] : urls[i]
+                metadata.push({ url })
+            }
+            
+            if (inputsArray.length === 0) {
+                throw new Error('No valid windows found (all windows contain NULL values)')
+            }
+            
+            // Stack all windows into 2D tensors [numWindows, windowSize]
+            const inputs = tf.stack(inputsArray)
+            const labels = tf.stack(labelsArray)
+            
+            // Clean up intermediate tensors
+            inputsArray.forEach(t => t.dispose())
+            labelsArray.forEach(t => t.dispose())
+            
+            console.log(`Created ${metadata.length} valid windows from ${values.length} data points (skipped ${values.length - windowSize + 1 - metadata.length} windows with NULL values)`)
+            
+            return { inputs, labels, metadata }
+        }
+
+        async function train(quick, modelname, getSampleWeights, getModel, inputWindowSize, labelWindowSize) {
             document.getElementById('run').disabled = true
             document.getElementById('progress').disabled = false
 
@@ -76,10 +158,48 @@
                 },
                 body: `SELECT * FROM model_train('${modelname}', ${quick})`
             })).json()
-            console.log(`${data.length} datasets loaded`)
+            
+            // Log data size based on format
+            if (Array.isArray(data)) {
+                console.log(`${data.length} datasets loaded`)
+            } else if (data.value) {
+                console.log(`${data.value.length} data points loaded (compact format)`)
+            }
             window.data = data
 
-            const model = getModel(data[0].inputs.length, data[0].labels.length)
+            let inputs, labels, metadata
+            
+            // Detect data format and convert if necessary
+            const isCompactFormat = !Array.isArray(data) && data.value !== undefined
+            const isArrayFormat = Array.isArray(data) && data.length > 0 && 
+                                   Object.prototype.hasOwnProperty.call(data[0], 'value') && 
+                                   !Object.prototype.hasOwnProperty.call(data[0], 'inputs')
+            
+            if (isCompactFormat || isArrayFormat) {
+                // New flat format (array or compact) - convert to sliding windows using tensor operations
+                if (inputWindowSize === undefined || labelWindowSize === undefined) {
+                    throw new Error('inputWindowSize and labelWindowSize are required for flat data format')
+                }
+                console.log(`Converting flat data to sliding windows using tensor operations (input: ${inputWindowSize}, label: ${labelWindowSize})`)
+                const result = createSlidingWindowTensors(data, inputWindowSize, labelWindowSize)
+                inputs = result.inputs
+                labels = result.labels
+                metadata = result.metadata
+                console.log(`${metadata.length} windows created from data points using GPU operations`)
+            } else if (Array.isArray(data) && data.length > 0) {
+                // Old format - convert to tensors directly
+                inputs = tf.tensor(data.map(d => d.inputs))
+                labels = tf.tensor(data.map(d => d.labels))
+                metadata = data.map(d => ({ url: d.url }))
+            } else {
+                throw new Error('No data available for training or unknown data format')
+            }
+
+            window.inputs = inputs
+            window.labels = labels
+            window.metadata = metadata
+
+            const model = getModel(inputs.shape[1], labels.shape[1])
             window.model = model
 
             let tfvisOnEpochEnd
@@ -97,7 +217,7 @@
                 ).onEpochEnd
             }
 
-            const sampleWeights = getSampleWeights(data[0].labels.length)
+            const sampleWeights = getSampleWeights(labels.shape[1])
             const loss = (labels, predictions, weights_, reduction) =>
                 tf.losses.meanSquaredError(labels, predictions, sampleWeights, reduction)
             model.compile({
@@ -107,10 +227,6 @@
             })
             console.log('model compiled')
 
-            const inputs = tf.tensor(data.map(d => d.inputs))
-            window.inputs = inputs
-            const labels = tf.tensor(data.map(d => d.labels))
-            window.labels = labels
 
             let onEpochEndRuns = false
             let timeLast = Date.now()
@@ -138,22 +254,30 @@
                                 const mse = mseP.sum(1)
                                 const mseMI = mse.argMax()
                                 const mseMaxI = mseMI.dataSync()[0]
-                                //const y = labels.slice(mseMaxI, 1)
-                                const p = predictions.slice(mseMaxI, 1)
-
+                                
                                 const iframe = document.getElementById('iframe')
-                                if (!window.iframeBlocked && data[mseMaxI].url) {
+                                if (!window.iframeBlocked && metadata[mseMaxI].url) {
                                     window.iframeBlocked = true
                                     setTimeout(() => {
                                         window.iframeBlocked = false
                                     }, 10000)
-                                    iframe.src = data[mseMaxI].url
+                                    iframe.src = metadata[mseMaxI].url
                                 }
+
+                                // Get the input and label tensors for the worst prediction
+                                const inputSlice = inputs.slice([mseMaxI, 0], [1, -1]).squeeze()
+                                const labelSlice = labels.slice([mseMaxI, 0], [1, -1]).squeeze()
+                                const predictionSlice = predictions.slice([mseMaxI, 0], [1, -1]).squeeze()
+                                
+                                // Convert to arrays for visualization
+                                const inputValues = Array.from(inputSlice.dataSync())
+                                const labelValues = Array.from(labelSlice.dataSync())
+                                const predictionValues = Array.from(predictionSlice.dataSync())
 
                                 tfvis.render.scatterplot(
                                     { name: 'Inputs' },
                                     {
-                                        values: data[mseMaxI].inputs.map((v, i) => ({ x: i, y: v })),
+                                        values: inputValues.map((v, i) => ({ x: i, y: v })),
                                     },
                                     {
                                         xLabel: 'Time',
@@ -165,8 +289,8 @@
                                     { name: 'Actual vs Prediction' },
                                     {
                                         values: [
-                                            data[mseMaxI].labels.map((v, i) => ({ x: i, y: v })),
-                                            Array.from(p.dataSync(), (v, i) => ({ x: i, y: v }))
+                                            labelValues.map((v, i) => ({ x: i, y: v })),
+                                            predictionValues.map((v, i) => ({ x: i, y: v }))
                                         ], series: ['actual', 'predicted']
                                     },
                                     {
@@ -176,10 +300,10 @@
                                     }
                                 )
 
-                                p.dispose()
-                                //y.dispose()
-                                mseMI.dispose()
-                                mse.dispose()
+                                // Clean up tensors
+                                inputSlice.dispose()
+                                labelSlice.dispose()
+                                predictionSlice.dispose()
                                 mseP.dispose()
                                 predictions.dispose()
                             }
@@ -256,7 +380,10 @@
 
                     //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
                     return model
-                })
+                },
+                48, // inputWindowSize
+                48  // labelWindowSize
+            )
         }
         async function outside_temperature_humidity(quick) {
             train(quick, 'outside_temperature_humidity',
@@ -273,7 +400,10 @@
 
                     //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
                     return model
-                })
+                },
+                96, // inputWindowSize (48 temp + 48 humidity)
+                96  // labelWindowSize (48 temp + 48 humidity)
+            )
         }
         async function outside_temperature_humidity_predict() {
             const model = await tf.loadLayersModel('localstorage://outside_temperature_humidity')
@@ -343,7 +473,10 @@ ARRAY[
 
                     model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
                     return model
-                })
+                },
+                96, // inputWindowSize
+                96  // labelWindowSize
+            )
         }
         async function from_midnight_outside_temperature_humidity_predict() {
             const model = await tf.loadLayersModel('localstorage://from_midnight_outside_temperature_humidity')
@@ -415,7 +548,11 @@ ARRAY[
                     model.add(tf.layers.dense({ units: noOfLabels }))
 
                     //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
-                })
+                    return model
+                },
+                48, // inputWindowSize
+                48  // labelWindowSize
+            )
         }
         async function outside_temperature_humidity_compressor_current_defrost_bath_temperature(quick) {
             train(quick, 'outside_temperature_humidity_compressor_current_defrost_bath_temperature',
@@ -432,7 +569,10 @@ ARRAY[
 
                     model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
                     return model
-                })
+                },
+                48, // inputWindowSize
+                48  // labelWindowSize
+            )
         } // 0.48 0.48 0.065
         async function from_midnight_outside_temperature_humidity_compressor_current_bath_temperature(quick) {
             train(quick, 'from_midnight_outside_temperature_humidity_compressor_current_bath_temperature',
@@ -449,7 +589,10 @@ ARRAY[
 
                     //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
                     return model
-                })
+                },
+                48, // inputWindowSize
+                48  // labelWindowSize
+            )
         } // 0.48 0.48 0.065
         async function from_midnight_outside_temperature_humidity_compressor_current_bath_temperature_predict() {
             const model = await tf.loadLayersModel('localstorage://from_midnight_outside_temperature_humidity_compressor_current_bath_temperature')
@@ -519,7 +662,10 @@ array(
 
                     //model.add(tf.layers.dense({ inputShape: [noOfInputs], units: noOfLabels }))
                     return model
-                })
+                },
+                48, // inputWindowSize
+                48  // labelWindowSize
+            )
         }
         function run(quick) {
             //outside_temperature_humidity(quick)
