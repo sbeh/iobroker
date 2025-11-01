@@ -67,38 +67,71 @@
     <script>
         /**
          * Creates sliding window tensors from flat time series data using GPU operations
-         * @param {Array} flatData - Array of {url, value} objects
+         * Supports both array and compact object formats:
+         * - Array format: [{url, value}, ...]
+         * - Compact format: {baseUrl, url: [...], value: [...]}
+         * 
+         * @param {Array|Object} flatData - Flat time series data
          * @param {number} inputWindowSize - Size of input window
          * @param {number} labelWindowSize - Size of label window
          * @returns {Object} Object with inputs and labels tensors, plus metadata array
          */
         function createSlidingWindowTensors(flatData, inputWindowSize, labelWindowSize) {
             const windowSize = inputWindowSize + labelWindowSize
-            const numWindows = flatData.length - windowSize + 1
             
-            if (numWindows <= 0) {
-                throw new Error(`Insufficient data: need at least ${windowSize} points, got ${flatData.length}`)
+            // Handle both data formats
+            let values, urls, baseUrl
+            if (Array.isArray(flatData)) {
+                // Old array format: [{url, value}, ...]
+                values = flatData.map(d => d.value)
+                urls = flatData.map(d => d.url)
+                baseUrl = null
+            } else {
+                // New compact format: {baseUrl, url: [...], value: [...]}
+                values = flatData.value
+                urls = flatData.url
+                baseUrl = flatData.baseUrl || ''
             }
             
-            // Extract values and URLs into separate arrays
-            const values = flatData.map(d => d.value)
-            const urls = flatData.map(d => d.url)
+            if (values.length < windowSize) {
+                throw new Error(`Insufficient data: need at least ${windowSize} points, got ${values.length}`)
+            }
             
-            // Create a 1D tensor with all values - this goes to GPU
-            const valuesTensor = tf.tensor1d(values)
-            
-            // Create sliding windows using tensor operations (on GPU)
+            // Create sliding windows, skipping windows with NULL values
             const inputsArray = []
             const labelsArray = []
+            const metadata = []
             
-            for (let i = 0; i < numWindows; i++) {
-                // Slice input window from the tensor
-                const inputSlice = valuesTensor.slice(i, inputWindowSize)
-                inputsArray.push(inputSlice)
+            for (let i = 0; i <= values.length - windowSize; i++) {
+                // Check if window contains any NULL/undefined values
+                let hasNull = false
+                for (let j = 0; j < windowSize; j++) {
+                    if (values[i + j] === null || values[i + j] === undefined) {
+                        hasNull = true
+                        break
+                    }
+                }
                 
-                // Slice label window from the tensor
-                const labelSlice = valuesTensor.slice(i + inputWindowSize, labelWindowSize)
-                labelsArray.push(labelSlice)
+                // Skip windows with NULL values
+                if (hasNull) {
+                    continue
+                }
+                
+                // Extract input and label values for this window
+                const inputValues = values.slice(i, i + inputWindowSize)
+                const labelValues = values.slice(i + inputWindowSize, i + windowSize)
+                
+                // Create tensors for this window
+                inputsArray.push(tf.tensor1d(inputValues))
+                labelsArray.push(tf.tensor1d(labelValues))
+                
+                // Store metadata
+                const url = baseUrl ? baseUrl + urls[i] : urls[i]
+                metadata.push({ url })
+            }
+            
+            if (inputsArray.length === 0) {
+                throw new Error('No valid windows found (all windows contain NULL values)')
             }
             
             // Stack all windows into 2D tensors [numWindows, windowSize]
@@ -106,15 +139,10 @@
             const labels = tf.stack(labelsArray)
             
             // Clean up intermediate tensors
-            valuesTensor.dispose()
             inputsArray.forEach(t => t.dispose())
             labelsArray.forEach(t => t.dispose())
             
-            // Create metadata array for URLs (lightweight, stays in RAM)
-            const metadata = []
-            for (let i = 0; i < numWindows; i++) {
-                metadata.push({ url: urls[i] })
-            }
+            console.log(`Created ${metadata.length} valid windows from ${values.length} data points (skipped ${values.length - windowSize + 1 - metadata.length} windows with NULL values)`)
             
             return { inputs, labels, metadata }
         }
@@ -130,14 +158,25 @@
                 },
                 body: `SELECT * FROM model_train('${modelname}', ${quick})`
             })).json()
-            console.log(`${data.length} datasets loaded`)
+            
+            // Log data size based on format
+            if (Array.isArray(data)) {
+                console.log(`${data.length} datasets loaded`)
+            } else if (data.value) {
+                console.log(`${data.value.length} data points loaded (compact format)`)
+            }
             window.data = data
 
             let inputs, labels, metadata
             
             // Detect data format and convert if necessary
-            if (data.length > 0 && Object.prototype.hasOwnProperty.call(data[0], 'value') && !Object.prototype.hasOwnProperty.call(data[0], 'inputs')) {
-                // New flat format - convert to sliding windows using tensor operations
+            const isCompactFormat = !Array.isArray(data) && data.value !== undefined
+            const isArrayFormat = Array.isArray(data) && data.length > 0 && 
+                                   Object.prototype.hasOwnProperty.call(data[0], 'value') && 
+                                   !Object.prototype.hasOwnProperty.call(data[0], 'inputs')
+            
+            if (isCompactFormat || isArrayFormat) {
+                // New flat format (array or compact) - convert to sliding windows using tensor operations
                 if (inputWindowSize === undefined || labelWindowSize === undefined) {
                     throw new Error('inputWindowSize and labelWindowSize are required for flat data format')
                 }
@@ -146,15 +185,14 @@
                 inputs = result.inputs
                 labels = result.labels
                 metadata = result.metadata
-                console.log(`${metadata.length} windows created from ${data.length} data points using GPU operations`)
-            } else {
+                console.log(`${metadata.length} windows created from data points using GPU operations`)
+            } else if (Array.isArray(data) && data.length > 0) {
                 // Old format - convert to tensors directly
-                if (data.length === 0) {
-                    throw new Error('No data available for training')
-                }
                 inputs = tf.tensor(data.map(d => d.inputs))
                 labels = tf.tensor(data.map(d => d.labels))
                 metadata = data.map(d => ({ url: d.url }))
+            } else {
+                throw new Error('No data available for training or unknown data format')
             }
 
             window.inputs = inputs
